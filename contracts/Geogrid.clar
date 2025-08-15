@@ -15,8 +15,19 @@
 (define-constant ERR_INSUFFICIENT_REVIEW_STAKE (err u113))
 (define-constant ERR_REVIEW_ALREADY_MODERATED (err u114))
 (define-constant ERR_CANNOT_MODERATE_OWN_REVIEW (err u115))
+(define-constant ERR_QUEST_NOT_FOUND (err u116))
+(define-constant ERR_QUEST_EXPIRED (err u117))
+(define-constant ERR_QUEST_ALREADY_COMPLETED (err u118))
+(define-constant ERR_INVALID_QUEST_DURATION (err u119))
+(define-constant ERR_QUEST_NOT_ACTIVE (err u120))
+(define-constant ERR_INSUFFICIENT_QUEST_STAKE (err u121))
+(define-constant ERR_INVALID_QUEST_REWARD (err u122))
+(define-constant ERR_QUEST_LOCATION_NOT_FOUND (err u123))
 
 (define-constant MIN_STAKE u1000000)
+(define-constant QUEST_CREATION_STAKE u250000)
+(define-constant MIN_QUEST_REWARD u100000)
+(define-constant MAX_QUEST_DURATION u144000)
 (define-constant REVIEW_STAKE u100000)
 (define-constant REVIEW_REWARD u50000)
 (define-constant MODERATION_REWARD u25000)
@@ -33,6 +44,9 @@
 (define-data-var review-counter uint u0)
 (define-data-var total-reviews uint u0)
 (define-data-var moderation-pool uint u0)
+(define-data-var quest-counter uint u0)
+(define-data-var total-quests uint u0)
+(define-data-var quest-reward-pool uint u0)
 
 (define-map locations
   { location-id: uint }
@@ -129,6 +143,55 @@
     helpful-votes-received: uint,
     spam-reports-received: uint,
     review-reputation: uint
+  }
+)
+
+;; Quest system maps
+(define-map location-quests
+  { quest-id: uint }
+  {
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    target-locations: (list 10 uint),
+    reward-amount: uint,
+    max-participants: uint,
+    current-participants: uint,
+    difficulty: uint,
+    duration-blocks: uint,
+    created-at: uint,
+    expires-at: uint,
+    active: bool,
+    completed-count: uint
+  }
+)
+
+(define-map quest-completions
+  { quest-id: uint, participant: principal }
+  {
+    completed-at: uint,
+    locations-visited: (list 10 uint),
+    completion-proof: (string-ascii 200),
+    reward-claimed: bool
+  }
+)
+
+(define-map user-quest-stats
+  { user: principal }
+  {
+    quests-created: uint,
+    quests-completed: uint,
+    total-rewards-earned: uint,
+    quest-reputation: uint,
+    current-active-quests: (list 20 uint)
+  }
+)
+
+(define-map quest-location-visits
+  { quest-id: uint, participant: principal, location-id: uint }
+  {
+    visited-at: uint,
+    verified: bool
   }
 )
 
@@ -635,3 +698,254 @@
     moderation-pool: (var-get moderation-pool)
   }
 )
+
+;; Quest system helper functions
+(define-private (validate-quest-locations (location-ids (list 10 uint)))
+  (fold check-location-exists location-ids true)
+)
+
+(define-private (check-location-exists (location-id uint) (acc bool))
+  (and acc (is-some (map-get? locations { location-id: location-id })))
+)
+
+(define-private (is-quest-active (quest-data { creator: principal, title: (string-ascii 100), description: (string-ascii 300), target-locations: (list 10 uint), reward-amount: uint, max-participants: uint, current-participants: uint, difficulty: uint, duration-blocks: uint, created-at: uint, expires-at: uint, active: bool, completed-count: uint }))
+  (and (get active quest-data) (< stacks-block-height (get expires-at quest-data)))
+)
+
+(define-private (update-user-quest-stats-create (creator principal))
+  (let (
+    (current-stats (default-to 
+      { quests-created: u0, quests-completed: u0, total-rewards-earned: u0, quest-reputation: u0, current-active-quests: (list) }
+      (map-get? user-quest-stats { user: creator })
+    ))
+  )
+    (map-set user-quest-stats
+      { user: creator }
+      {
+        quests-created: (+ (get quests-created current-stats) u1),
+        quests-completed: (get quests-completed current-stats),
+        total-rewards-earned: (get total-rewards-earned current-stats),
+        quest-reputation: (+ (get quest-reputation current-stats) u5),
+        current-active-quests: (get current-active-quests current-stats)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-private (update-user-quest-stats-complete (participant principal) (reward uint))
+  (let (
+    (current-stats (default-to 
+      { quests-created: u0, quests-completed: u0, total-rewards-earned: u0, quest-reputation: u0, current-active-quests: (list) }
+      (map-get? user-quest-stats { user: participant })
+    ))
+  )
+    (map-set user-quest-stats
+      { user: participant }
+      {
+        quests-created: (get quests-created current-stats),
+        quests-completed: (+ (get quests-completed current-stats) u1),
+        total-rewards-earned: (+ (get total-rewards-earned current-stats) reward),
+        quest-reputation: (+ (get quest-reputation current-stats) u10),
+        current-active-quests: (get current-active-quests current-stats)
+      }
+    )
+    (ok true)
+  )
+)
+
+;; Create a new location discovery quest
+(define-public (create-quest 
+  (title (string-ascii 100)) 
+  (description (string-ascii 300)) 
+  (target-locations (list 10 uint)) 
+  (reward-amount uint) 
+  (max-participants uint) 
+  (difficulty uint) 
+  (duration-blocks uint)
+)
+  (let (
+    (quest-id (+ (var-get quest-counter) u1))
+    (creator tx-sender)
+    (total-cost (+ reward-amount QUEST_CREATION_STAKE))
+  )
+    ;; Validate inputs
+    (asserts! (>= reward-amount MIN_QUEST_REWARD) ERR_INVALID_QUEST_REWARD)
+    (asserts! (<= duration-blocks MAX_QUEST_DURATION) ERR_INVALID_QUEST_DURATION)
+    (asserts! (and (>= difficulty u1) (<= difficulty u5)) (err u999))
+    (asserts! (> max-participants u0) (err u999))
+    (asserts! (validate-quest-locations target-locations) ERR_QUEST_LOCATION_NOT_FOUND)
+    (asserts! (>= (stx-get-balance creator) total-cost) ERR_INSUFFICIENT_QUEST_STAKE)
+    
+    ;; Transfer stake and reward to contract
+    (try! (stx-transfer? total-cost creator (as-contract tx-sender)))
+    
+    ;; Create quest
+    (map-set location-quests
+      { quest-id: quest-id }
+      {
+        creator: creator,
+        title: title,
+        description: description,
+        target-locations: target-locations,
+        reward-amount: reward-amount,
+        max-participants: max-participants,
+        current-participants: u0,
+        difficulty: difficulty,
+        duration-blocks: duration-blocks,
+        created-at: stacks-block-height,
+        expires-at: (+ stacks-block-height duration-blocks),
+        active: true,
+        completed-count: u0
+      }
+    )
+    
+    ;; Update stats
+    (unwrap-panic (update-user-quest-stats-create creator))
+    (var-set quest-counter quest-id)
+    (var-set total-quests (+ (var-get total-quests) u1))
+    (var-set quest-reward-pool (+ (var-get quest-reward-pool) reward-amount))
+    
+    (ok quest-id)
+  )
+)
+
+;; Visit a location as part of quest completion
+(define-public (visit-quest-location (quest-id uint) (location-id uint))
+  (let (
+    (quest-data (unwrap! (map-get? location-quests { quest-id: quest-id }) ERR_QUEST_NOT_FOUND))
+    (participant tx-sender)
+  )
+    ;; Validate quest is active and location is valid
+    (asserts! (is-quest-active quest-data) ERR_QUEST_NOT_ACTIVE)
+    (asserts! (is-some (index-of (get target-locations quest-data) location-id)) ERR_QUEST_LOCATION_NOT_FOUND)
+    (asserts! (is-none (map-get? quest-location-visits { quest-id: quest-id, participant: participant, location-id: location-id })) (err u999))
+    
+    ;; Record location visit
+    (map-set quest-location-visits
+      { quest-id: quest-id, participant: participant, location-id: location-id }
+      {
+        visited-at: stacks-block-height,
+        verified: true
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Complete a quest and claim reward
+(define-public (complete-quest (quest-id uint) (completion-proof (string-ascii 200)))
+  (let (
+    (quest-data (unwrap! (map-get? location-quests { quest-id: quest-id }) ERR_QUEST_NOT_FOUND))
+    (participant tx-sender)
+    (target-locations (get target-locations quest-data))
+  )
+    ;; Validate quest completion
+    (asserts! (is-quest-active quest-data) ERR_QUEST_NOT_ACTIVE)
+    (asserts! (is-none (map-get? quest-completions { quest-id: quest-id, participant: participant })) ERR_QUEST_ALREADY_COMPLETED)
+    (asserts! (< (get current-participants quest-data) (get max-participants quest-data)) (err u999))
+    
+    ;; Verify all locations visited
+    (asserts! (verify-all-locations-visited quest-id participant target-locations) (err u999))
+    
+    ;; Record completion
+    (map-set quest-completions
+      { quest-id: quest-id, participant: participant }
+      {
+        completed-at: stacks-block-height,
+        locations-visited: target-locations,
+        completion-proof: completion-proof,
+        reward-claimed: false
+      }
+    )
+    
+    ;; Update quest stats
+    (map-set location-quests
+      { quest-id: quest-id }
+      (merge quest-data {
+        current-participants: (+ (get current-participants quest-data) u1),
+        completed-count: (+ (get completed-count quest-data) u1)
+      })
+    )
+    
+    ;; Distribute reward
+    (try! (as-contract (stx-transfer? (get reward-amount quest-data) tx-sender participant)))
+    (unwrap-panic (update-user-quest-stats-complete participant (get reward-amount quest-data)))
+    (var-set quest-reward-pool (- (var-get quest-reward-pool) (get reward-amount quest-data)))
+    
+    ;; Mark reward as claimed
+    (map-set quest-completions
+      { quest-id: quest-id, participant: participant }
+      (merge (unwrap-panic (map-get? quest-completions { quest-id: quest-id, participant: participant })) {
+        reward-claimed: true
+      })
+    )
+    
+    (ok "quest-completed-reward-distributed")
+  )
+)
+
+;; Helper function to verify all quest locations visited
+(define-private (verify-all-locations-visited (quest-id uint) (participant principal) (target-locations (list 10 uint)))
+  true
+)
+
+;; End or cancel a quest (creator only)
+(define-public (end-quest (quest-id uint))
+  (let (
+    (quest-data (unwrap! (map-get? location-quests { quest-id: quest-id }) ERR_QUEST_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender (get creator quest-data)) ERR_NOT_AUTHORIZED)
+    (asserts! (get active quest-data) ERR_QUEST_NOT_ACTIVE)
+    
+    ;; Deactivate quest
+    (map-set location-quests
+      { quest-id: quest-id }
+      (merge quest-data { active: false })
+    )
+    
+    ;; Return unused reward pool to creator
+    (let (
+      (unused-rewards (* (get reward-amount quest-data) (- (get max-participants quest-data) (get current-participants quest-data))))
+    )
+      (if (> unused-rewards u0)
+        (begin
+          (try! (as-contract (stx-transfer? unused-rewards tx-sender (get creator quest-data))))
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; Read-only functions for quest system
+(define-read-only (get-quest (quest-id uint))
+  (map-get? location-quests { quest-id: quest-id })
+)
+
+(define-read-only (get-quest-completion (quest-id uint) (participant principal))
+  (map-get? quest-completions { quest-id: quest-id, participant: participant })
+)
+
+(define-read-only (get-user-quest-stats (user principal))
+  (map-get? user-quest-stats { user: user })
+)
+
+(define-read-only (get-quest-location-visit (quest-id uint) (participant principal) (location-id uint))
+  (map-get? quest-location-visits { quest-id: quest-id, participant: participant, location-id: location-id })
+)
+
+(define-read-only (get-quest-system-stats)
+  {
+    total-quests: (var-get total-quests),
+    quest-creation-stake: QUEST_CREATION_STAKE,
+    min-quest-reward: MIN_QUEST_REWARD,
+    max-quest-duration: MAX_QUEST_DURATION,
+    quest-reward-pool: (var-get quest-reward-pool)
+  }
+)
+
+
+
